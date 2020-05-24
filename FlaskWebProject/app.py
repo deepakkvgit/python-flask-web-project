@@ -21,6 +21,7 @@ from db import init_db_command
 from user import User
 
 # Configuration
+# https://github.com/settings/applications/1299368
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", None)
 GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", None)
 GITHUB_DISCOVERY_URL = ("https://github.com/login/oauth/authorize")
