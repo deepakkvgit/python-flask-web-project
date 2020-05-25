@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import logging
 
 #Third party imports
 from flask import Flask, redirect, request, url_for
@@ -22,11 +23,14 @@ from user import User
 
 # Configuration
 # https://github.com/settings/applications/1299368
-GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", None)
-GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", None)
-GITHUB_DISCOVERY_URL = ("https://github.com/login/oauth/authorize")
+GITHUB_CLIENT_ID = os.environ["GITHUB_CLIENT_ID"]
+GITHUB_CLIENT_SECRET = os.environ["GITHUB_CLIENT_SECRET"]
+GITHUB_AUTH_URL = "https://github.com/login/oauth/authorize"
+GITHUB_TOKEN_URL = "https://github.com/login/oauth/access_token"
+GITHUB_USERINFO_URL = "https://api.github.com/user"
 
-
+logging.basicConfig(filename='application_log.log', filemode='w', format='%(name)s - %(levelname)s - %(message)s')
+logging.info("Initializing application...")
 # Create an instance of the Flask class that is the WSGI application.
 # The first argument is the name of the application module or package,
 # typically __name__ when using a single module.
@@ -41,8 +45,9 @@ login_manager.init_app(app)
 # Naive database setup
 try:
     init_db_command()
-except sqlite3.OperationalError:
+except sqlite3.OperationalError as e:
     # Assume it's already been created
+    logging.error("Exception in initializing db", exc_info=True)
     pass
 
 # OAuth 2 client setup
@@ -77,74 +82,72 @@ def get_github_provider_cfg():
 
 @app.route("/login")
 def login():
-    # Find out what URL to hit for github login
-    github_provider_cfg = get_github_provider_cfg()
-    authorization_endpoint = github_provider_cfg["authorization_endpoint"]
-
-    # Use library to construct the request for github login and provide
-    # scopes that let you retrieve user's profile from github
-    request_uri = client.prepare_request_uri(
-        authorization_endpoint,
-        redirect_uri=request.base_url + "/callback",
-        scope=["openid", "email", "profile"],
-    )
+    try:
+        # Use library to construct the request for github login and provide
+        # scopes that let you retrieve user's profile from github
+        request_uri = client.prepare_request_uri(
+            GITHUB_AUTH_URL,
+            redirect_uri=request.base_url + "/callback",
+            scope=["openid", "email", "profile"],
+        )
+    except Exception as e:
+        logging.error("Exception in login", exc_info=True)
     return redirect(request_uri)
 
 @app.route("/login/callback")
 def callback():
-    # Get authorization code Github sent back to you
-    code = request.args.get("code")
-    # Find out what URL to hit to get tokens that allow you to ask for
-    # things on behalf of a user
-    github_provider_cfg = get_github_provider_cfg()
-    token_endpoint = github_provider_cfg["token_endpoint"]
-    # Prepare and send a request to get tokens! Yay tokens!
-    token_url, headers, body = client.prepare_token_request(
-        token_endpoint,
-        authorization_response=request.url,
-        redirect_url=request.base_url,
-        code=code
-    )
-    token_response = requests.post(
-        token_url,
-        headers=headers,
-        data=body,
-        auth=(GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET),
-    )
+    try:
+        # Get authorization code Github sent back to you
+        code = request.args.get("code")
+       
+        # Prepare and send a request to get tokens! Yay tokens!
+        token_url, headers, body = client.prepare_token_request(
+            GITHUB_TOKEN_URL,
+            authorization_response=request.url,
+            redirect_url=request.base_url,
+            code=code
+        )
+        token_response = requests.post(
+            token_url,
+            headers=headers,
+            data=body,
+            auth=(GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET),
+        )
 
+        logging.info("token_response",token_response.content)
     
-    # Parse the tokens!
-    client.parse_request_body_response(json.dumps(token_response.json()))
+        # Parse the tokens!
+        #client.parse_request_body_response(json.dumps(token_response.json()))
 
-    # Now that you have tokens (yay) let's find and hit the URL
-    # from github that gives you the user's profile information,
-    # including their github profile image and email
-    userinfo_endpoint = github_provider_cfg["userinfo_endpoint"]
-    uri, headers, body = client.add_token(userinfo_endpoint)
-    userinfo_response = requests.get(uri, headers=headers, data=body)
-    # You want to make sure their email is verified.
-    # The user authenticated with github, authorized your
-    # app, and now you've verified their email through github!
-    if userinfo_response.json().get("email_verified"):
-        unique_id = userinfo_response.json()["sub"]
-        users_email = userinfo_response.json()["email"]
-        picture = userinfo_response.json()["picture"]
-        users_name = userinfo_response.json()["given_name"]
-    else:
-        return "User email not available or not verified by github.", 400
-    # Create a user in your db with the information provided
-    # by github
-    user = User(
-        id_=unique_id, name=users_name, email=users_email, profile_pic=picture
-    )
+        # Now that you have tokens (yay) let's hit the URL
+        # from github that gives you the user's profile information,
+        # including their github profile image and email
+        #uri, headers, body = client.add_token(GITHUB_USERINFO_URL)
+        #userinfo_response = requests.get(uri, headers=headers, data=body)
+        
+        userinfo_response = requests.get(GITHUB_USERINFO_URL+"?"+token_response.content.decode("utf-8") , headers=headers, data=token_response.content)
 
-    # Doesn't exist? Add it to the database.
-    if not User.get(unique_id):
-        User.create(unique_id, users_name, users_email, picture)
+        if userinfo_response.json().get("name"):
+            unique_id = userinfo_response.json()["login"]
+            users_email = userinfo_response.json()["email"]
+            profile_pic = userinfo_response.json()["avatar_url"]
+            users_name = userinfo_response.json()["name"]
+        else:
+            return "User not available or not verified by github.", 400
+        # Create a user in your db with the information provided
+        # by github
+        user = User(
+            id_=unique_id, name=users_name, email=users_email, profile_pic = profile_pic
+        )
 
-    # Begin user session by logging the user in
-    login_user(user)
+        # Doesn't exist? Add it to the database.
+        if not User.get(unique_id):
+            User.create(unique_id, users_name, users_email, profile_pic)
 
+        # Begin user session by logging the user in
+        login_user(user)
+    except Exception as e:
+        logging.error("Exception in login", exc_info=True)
     # Send user back to homepage
     return redirect(url_for("index"))
 
@@ -155,11 +158,8 @@ def logout():
     logout_user()
     return redirect(url_for("index"))
 
-
-
-
-
 if __name__ == '__main__':
     # Run the app server on localhost:4449
     app.register_blueprint(bp, url_prefix ="/test")
-    app.run('localhost', 4449, ssl_context ='adhoc')
+    context = ('selfsigned.crt', 'selfsigned.key')#certificate and key files
+    app.run('localhost', 4449, ssl_context=context)
